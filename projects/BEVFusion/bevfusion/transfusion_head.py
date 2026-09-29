@@ -528,7 +528,11 @@ class TransFusionHead(nn.Module):
             pred_dict = {}
             for key in preds_dict[0].keys():
                 preds = []
-                for i in range(self.num_decoder_layers):
+                # forward_single returns ONE dict with all layers
+                # concatenated along the proposals (auxiliary=True) or only
+                # the last layer, so iterate the list, not the layer count
+                # (num_decoder_layers > 1 used to raise IndexError here)
+                for i in range(len(preds_dict)):
                     pred_one_layer = preds_dict[i][key][batch_idx:batch_idx +
                                                         1]
                     preds.append(pred_one_layer)

@@ -271,8 +271,13 @@ class HungarianAssigner3D(BaseAssigner):
             if num_gts == 0:
                 # No ground truth, assign all to background
                 assigned_gt_inds[:] = 0
+            # zeros, not None: TransFusionHead concatenates max_overlaps
+            # across decoder layers, which crashes on GT-free frames
             return AssignResult(
-                num_gts, assigned_gt_inds, None, labels=assigned_labels)
+                num_gts,
+                assigned_gt_inds,
+                bboxes.new_zeros((num_bboxes, )),
+                labels=assigned_labels)
 
         # 2. compute the weighted costs
         # Hard code here to be compatible with the interface of
