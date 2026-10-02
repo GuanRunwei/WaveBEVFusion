@@ -8,9 +8,10 @@ its cell for 53-99% of boxes, vs 1-6% for the nearest corner and 12-24% for
 the centre; progress/20260927_231500_evidence-anchor-analysis), so the
 heatmap peaks there and an anchor-to-centre vector is regressed.
 
-Sea surface. The height of every detection comes from
-:class:`SeaSurface`: its own waterline, its neighbours' and the Kalman mean
-level, fused by their learned uncertainties.
+Sea surface. :class:`SeaSurface` (IMU tilt, Kalman mean level, GP waves)
+fuses every hull's waterline with its neighbours' and the mean level by
+their learned uncertainties; in training this supervises the heads (the
+final configs use it as training supervision only, ``sea_at_test=False``).
 """
 from typing import List
 
@@ -86,6 +87,33 @@ class Pack3DDetInputsAnchor(Pack3DDetInputs):
     ]
 
 
+def a2c_offset(code: Tensor, dim: Tensor, yaw: Tensor,
+               frame: str) -> Tensor:
+    """Anchor-to-centre vector (m, [..., 2]) from its code.
+
+    'bev': the code is the vector in metres. 'local': the code is the
+    centre's position in the box frame as fractions of the hull, (alpha
+    along the length, beta across the width); dim (m) and yaw are the box's.
+    """
+    if frame == 'bev':
+        return code
+    yaw = yaw.reshape(code.shape[:-1])
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    dl = code[..., 0] * dim[..., 0]
+    dw = code[..., 1] * dim[..., 1]
+    return torch.stack([dl * c - dw * s, dl * s + dw * c], dim=-1)
+
+
+def a2c_code(vec: Tensor, dim: Tensor, yaw: Tensor, frame: str) -> Tensor:
+    """Inverse of :func:`a2c_offset` (vec: anchor -> centre, m)."""
+    if frame == 'bev':
+        return vec
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    al = (vec[..., 0] * c + vec[..., 1] * s) / dim[..., 0]
+    be = (-vec[..., 0] * s + vec[..., 1] * c) / dim[..., 1]
+    return torch.stack([al, be], dim=-1)
+
+
 @TASK_UTILS.register_module()
 class EvidenceCenterPointBBoxCoder(CenterPointBBoxCoder):
     """Decodes anchor + anchor-to-centre vector into the box centre.
@@ -95,9 +123,12 @@ class EvidenceCenterPointBBoxCoder(CenterPointBBoxCoder):
     it into a 7-dof box after refining the heights on the sea surface.
     """
 
-    def __init__(self, *args, a2c_scale: float = 2.0, **kwargs) -> None:
+    def __init__(self, *args, a2c_scale: float = 2.0,
+                 a2c_frame: str = 'bev', **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        assert a2c_frame in ('bev', 'local')
         self.a2c_scale = float(a2c_scale)
+        self.a2c_frame = a2c_frame
 
     def decode(self, heat, rot_sine, rot_cosine, hei, dim, vel, reg=None,
                task_id=-1) -> List[dict]:
@@ -117,12 +148,14 @@ class EvidenceCenterPointBBoxCoder(CenterPointBBoxCoder):
         extra = gather(vel, 4)
         cell_x = self.out_size_factor * self.voxel_size[0]
         cell_y = self.out_size_factor * self.voxel_size[1]
-        xs = xs * cell_x + self.pc_range[0] + extra[..., 0:1] * self.a2c_scale
-        ys = ys * cell_y + self.pc_range[1] + extra[..., 1:2] * self.a2c_scale
         rot = torch.atan2(gather(rot_sine, 1), gather(rot_cosine, 1))
+        dim = gather(dim, 3)
+        off = a2c_offset(extra[..., 0:2] * self.a2c_scale, dim, rot,
+                         self.a2c_frame)
+        xs = xs * cell_x + self.pc_range[0] + off[..., 0:1]
+        ys = ys * cell_y + self.pc_range[1] + off[..., 1:2]
         boxes = torch.cat(
-            [xs, ys, gather(hei, 1), gather(dim, 3), rot, extra[..., 2:4]],
-            dim=2)
+            [xs, ys, gather(hei, 1), dim, rot, extra[..., 2:4]], dim=2)
         clses = clses.view(batch, K).float()
         scores = scores.view(batch, K)
         pcr = torch.as_tensor(self.post_center_range, device=heat.device)
@@ -153,32 +186,44 @@ class EvidenceSeaCenterHead(CenterHead):
     the GT anchor cells (teacher forcing), with positions, sizes and own
     heights detached; the fused height is supervised by an L1 on the GT
     gravity-centre z, the waterline scales by a Laplace NLL and the
-    posterior mean level by an L1 on the GT level. Test: the most confident
-    detections after NMS observe the sea and every detection's bottom
-    becomes sea + fb; the mean level is streamed over each sequence
-    (evaluate with SequentialChunkSampler).
+    posterior mean level by an L1 on the GT level. Test: with
+    ``sea_at_test=False`` the boxes keep the head's own heights; with True
+    the most confident detections after NMS observe the sea, every
+    detection's bottom becomes sea + fb and the mean level is streamed over
+    each sequence (evaluate with SequentialChunkSampler).
 
     Args:
-        a2c_scale (float): Metres per unit of the a2c code.
+        a2c_scale (float): Metres per unit of the a2c code ('bev'), or
+            hull fractions per unit ('local').
+        a2c_frame (str): 'bev' (vector in metres) or 'local' (centre as
+            fractions of the box length / width in the box frame: bounded,
+            dimensionless, the same range for a 6 m boat and a 70 m ship).
         sea_surface (dict, optional): :class:`SeaSurface` arguments; None
             gives plain evidence-anchor CenterPoint.
         loss_final_height_weight (float): L1 on the fused height.
         loss_sigma_weight (float): Laplace NLL of the waterline scales.
         loss_level_weight (float): L1 of the posterior mean level.
+        sea_at_test (bool): Put the detections on the sea surface at test
+            time. False keeps the head's own heights (the sea surface then
+            only acts through the training losses).
     """
 
     def __init__(self,
                  *args,
                  a2c_scale: float = 2.0,
+                 a2c_frame: str = 'bev',
                  sea_surface: dict = None,
                  loss_final_height_weight: float = 0.25,
                  loss_sigma_weight: float = 0.25,
                  loss_level_weight: float = 0.5,
+                 sea_at_test: bool = True,
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
         heads = self.task_heads[0].heads
         assert 'a2c' in heads, "needs common_heads['a2c'] = (2, 2)"
+        assert a2c_frame in ('bev', 'local')
         self.a2c_scale = float(a2c_scale)
+        self.a2c_frame = a2c_frame
         self.sea = None
         if sea_surface is not None:
             assert 'sig' in heads and 'fb' in heads, \
@@ -187,6 +232,7 @@ class EvidenceSeaCenterHead(CenterHead):
         self.loss_final_height_weight = float(loss_final_height_weight)
         self.loss_sigma_weight = float(loss_sigma_weight)
         self.loss_level_weight = float(loss_level_weight)
+        self.sea_at_test = bool(sea_at_test)
         self._metas = None
 
     # ------------------------------------------------------------ targets
@@ -244,7 +290,8 @@ class EvidenceSeaCenterHead(CenterHead):
                 code[k] = torch.cat([
                     axy - aint.float(), b[2:3], dim,
                     torch.sin(b[6:7]), torch.cos(b[6:7]),
-                    (b[:2] - a) / self.a2c_scale
+                    a2c_code(b[:2] - a, b[3:5], b[6], self.a2c_frame) /
+                    self.a2c_scale
                 ])
             heatmaps.append(heatmap)
             codes.append(code)
@@ -301,16 +348,22 @@ class EvidenceSeaCenterHead(CenterHead):
                 loss_dict.update(self._sea_losses(at_gt))
         return loss_dict
 
-    def _cell_to_m(self, ind: Tensor, sub: Tensor, a2c: Tensor):
-        """Box centre (m) from anchor cell index, sub-cell offset, a2c."""
+    def _cell_to_m(self, ind: Tensor, code: Tensor):
+        """Box centre (m) from the anchor cell index and the box code
+        [sub-cell offset (2), z, log l w h (3), sin, cos, a2c (2)]."""
         cfg = self.train_cfg
         osf, vs, pcr = cfg['out_size_factor'], cfg['voxel_size'], \
             cfg['point_cloud_range']
         fw = int(cfg['grid_size'][0]) // osf
-        cx = (ind % fw).float() + sub[..., 0]
-        cy = (ind // fw).float() + sub[..., 1]
-        x = cx * vs[0] * osf + pcr[0] + a2c[..., 0] * self.a2c_scale
-        y = cy * vs[1] * osf + pcr[1] + a2c[..., 1] * self.a2c_scale
+        cx = (ind % fw).float() + code[..., 0]
+        cy = (ind // fw).float() + code[..., 1]
+        dim = code[..., 3:6].clamp(*LOG_DIM_RANGE).exp() if self.norm_bbox \
+            else code[..., 3:6]
+        yaw = torch.atan2(code[..., 6], code[..., 7])
+        off = a2c_offset(code[..., 8:10] * self.a2c_scale, dim, yaw,
+                         self.a2c_frame)
+        x = cx * vs[0] * osf + pcr[0] + off[..., 0]
+        y = cy * vs[1] * osf + pcr[1] + off[..., 1]
         return x, y
 
     def _sea_losses(self, at_gt: List[dict]) -> dict:
@@ -330,12 +383,11 @@ class EvidenceSeaCenterHead(CenterHead):
         pred, tgt = g['pred'].float(), g['tgt']
         logd = pred[..., 3:6].clamp(*LOG_DIM_RANGE).detach()
         L, h = logd[..., 0].exp(), logd[..., 2].exp()
-        x, y = self._cell_to_m(g['ind'], pred[..., 0:2].detach(),
-                               pred[..., 8:10].detach())
+        x, y = self._cell_to_m(g['ind'], pred.detach())
         bottom = pred[..., 2].detach() - 0.5 * h
         z_gt = tgt[..., 2]
         bottom_gt = z_gt - 0.5 * tgt[..., 5].exp()
-        gx, gy = self._cell_to_m(g['ind'], tgt[..., 0:2], tgt[..., 8:10])
+        gx, gy = self._cell_to_m(g['ind'], tgt)
         metas = self._metas or [{} for _ in range(m.shape[0])]
         tilt = self.sea.tilt(metas, m.device)
         levels = []
@@ -379,7 +431,7 @@ class EvidenceSeaCenterHead(CenterHead):
         for meta, r in zip(batch_input_metas, results):
             b = r.bboxes_3d.tensor  # z is the bottom, cols 7/8: log_b, fb
             box = b[:, :7].clone()
-            if self.sea is not None:
+            if self.sea is not None and self.sea_at_test:
                 box[:, 2] = self._sea_bottoms(meta, b, r.scores_3d)
             r.bboxes_3d = meta['box_type_3d'](box, box_dim=7)
         return results
@@ -391,7 +443,8 @@ class EvidenceSeaCenterHead(CenterHead):
             tilt = self.sea.tilt([meta], b.device)
             c_prior, P_prior = self.sea.level_prior([meta])
             if b.shape[0] == 0:
-                self.sea.update_stream([meta], c_prior, P_prior)
+                if not self.training:
+                    self.sea.update_stream([meta], c_prior, P_prior)
                 return b[:, 2]
             x, y, L = b[None, :, 0], b[None, :, 1], b[None, :, 3]
             sea, c_post, P_post = self.sea.solve(
@@ -400,5 +453,6 @@ class EvidenceSeaCenterHead(CenterHead):
                          log_b=b[None, :, 7], score=scores[None].float(),
                          mask=torch.ones_like(x)),
                 qry=dict(x=x, y=y, L=L))
-            self.sea.update_stream([meta], c_post, P_post)
+            if not self.training:  # stage-1 proposals of MariFusion
+                self.sea.update_stream([meta], c_post, P_post)
             return sea[0] + b[:, 8]

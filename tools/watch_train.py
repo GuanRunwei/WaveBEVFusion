@@ -106,6 +106,19 @@ def show(run, args):
     if log is None:
         return f'== {name}: 没找到日志\n'
     r = parse(log)
+    # the maritime metric's own tables are per evaluation; the logged
+    # summary of runs before 2026-09-29 is a running mean (see
+    # tools/maritime_val_history.py), so prefer the tables
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from maritime_val_history import parse_log as parse_tables
+        for ep, v in parse_tables(log).items():
+            if ep in r['vals']:
+                r['vals'][ep].update({f'Maritime/{k}': x / 100.0
+                                      for k, x in v.items()
+                                      if x is not None and 'n_gt' not in k})
+    except Exception:
+        pass
     out = [f'== {name}   ({log})']
     now = datetime.now()
     if r['last_ts']:

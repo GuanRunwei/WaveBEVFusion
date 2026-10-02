@@ -1,4 +1,4 @@
-"""Per-frame gravity direction for the IMU-anchored sea surface (WAHead)."""
+"""Per-frame gravity direction for the IMU-anchored sea surface."""
 import os
 import warnings
 
@@ -47,7 +47,7 @@ class LoadSeaUp(BaseTransform):
             relative displacement, so it is not touched by the augmentation.
         Always adds ``sea_up_rot`` (float32 [2, 2]): the map of the tilt from
         the body frame to the augmented frame (identity without
-        augmentation), for WAHead's ``tilt_gain``.
+        augmentation), for the per-axis tilt gain of the sea surface.
     """
 
     def __init__(self, lookup: str, up_key: str = 'up_causal',

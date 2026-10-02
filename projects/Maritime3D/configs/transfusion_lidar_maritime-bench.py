@@ -191,7 +191,23 @@ env_cfg = dict(
     cudnn_benchmark=False,
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
     dist_cfg=dict(backend='nccl'))
-log_processor = dict(type='LogProcessor', window_size=50, by_epoch=True)
+# mmengine averages every scalar matching its default mean_pattern
+# '.*(loss|time|data_time|grad_norm).*' over the window -- and
+# 'Mari*time*/mAP3D' matches, so the logged val metrics of earlier runs were
+# running means over all evaluations (tools/maritime_val_history.py recovers
+# the true values from the tables). Average only the training scalars.
+log_processor = dict(
+    type='LogProcessor',
+    window_size=50,
+    by_epoch=True,
+    mean_pattern=r'(^|[._/])loss|^time$|^data_time$|^grad_norm$')
 log_level = 'INFO'
 load_from = None
 resume = False
+
+# TensorBoard next to the json scalars (work_dirs/<run>/<ts>/vis_data)
+visualizer = dict(
+    type='Det3DLocalVisualizer',
+    vis_backends=[dict(type='LocalVisBackend'),
+                  dict(type='TensorboardVisBackend')],
+    name='visualizer')
